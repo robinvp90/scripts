@@ -4,15 +4,23 @@
     flags which of them have no matching Microsoft Entra B2B guest account.
 
 .DESCRIPTION
-    Context: MC1243549 - retirement of SharePoint One-Time Passcode (SPO OTP) authentication.
-    Phase 2 begins mid-October 2026 and is expected to complete by end of November 2026.
-    External users WITHOUT an Entra B2B guest account lose access to previously shared links.
+    Context: Microsoft is moving external user authentication in SharePoint and OneDrive
+    from SharePoint Online to Microsoft Entra B2B (Message Center MC1243549).
+    One-time passcode itself is NOT being retired - Entra B2B uses OTP by default. What
+    goes away is the SharePoint-only guest: an external user who was shared content via
+    SPO OTP and never got an Entra B2B guest account. Once the retirement reaches your
+    tenant, those users get access denied on previously shared links.
+
+    A guest who already has an Entra B2B account keeps access to everything previously
+    shared with them, so the fix is to find the ones who don't. Microsoft's documented
+    way to do that is the site-level external sharing report, one site at a time. This
+    script does it across every SharePoint site and OneDrive in the tenant.
 
     Detection logic:
       * SPO-only OTP guest  -> site login name contains 'urn:spo:guest' (or encoded 'spo%3aguest')
       * Entra B2B guest     -> site login name contains '#EXT#'
 
-    SETUP (v3.0): fully automated, one sign-in, no manual steps.
+    SETUP: fully automated, one sign-in, no manual steps.
     Register-PnPEntraIDApp is NOT used - it runs its own sign-in and consent flows that
     prompt twice, print device codes unpredictably and hang. Instead this script does the
     whole setup itself against Graph REST with a single device-code sign-in:
@@ -24,6 +32,18 @@
         6. caches everything, then retries the connection while consent propagates
     Re-running is safe: every step is skipped if already done.
 
+    On later runs, if a saved setup exists for the tenant, the script shows it and asks
+    whether to use it or run setup again. -UseCachedSetup skips the question and uses the
+    saved setup; -Reset skips it and runs setup again.
+
+    PERMISSIONS (application, admin-consented):
+      * Microsoft Graph  User.Read.All          - read guest accounts
+      * SharePoint       Sites.FullControl.All  - app-only access to the SharePoint
+                                                  tenant-admin APIs, which tenant-wide
+                                                  site enumeration needs
+    Sites.FullControl.All is powerful. The report itself only reads, but delete the app
+    registration when your audit is finished - see CLEANUP below.
+
     KNOWN LIMITATION:
     Only guests who have signed in to the site at least once appear in the site User
     Information List. A recipient sent a link who never opened it will NOT appear. Use the
@@ -34,22 +54,57 @@
     Microsoft.Graph SDK in the same session (pnp/powershell issue 3395). This script uses
     PnP only, and talks to Graph over raw REST or Invoke-PnPGraphMethod.
 
+    DEVICE CODE FLOW:
+    Setup signs in with the OAuth device code flow. If a Conditional Access policy blocks
+    device code flow in your tenant, create the app registration yourself and pass
+    -ClientId and -CertificateThumbprint instead.
+
+    PRIVACY:
+    The CSV contains external users' names and email addresses. Treat it as confidential.
+    The cached SPO-OTP-Audit.<tenant>.config.json file identifies your tenant and app
+    registration; keep it out of source control.
+
+    CLEANUP (when the audit is done):
+      1. Entra admin centre > App registrations > delete the app (its name is printed at
+         start-up, by default SPO-OTP-Audit-<user>-<computer>).
+      2. certmgr.msc > Personal > Certificates > delete the certificate with the same name.
+      3. Delete the SPO-OTP-Audit.<tenant>.config.json file next to the script.
+
 .NOTES
-    Author : Robin Poulose
-    Setup  : CREATES an Entra app, certificate and consent (idempotent).
-    Report : READ ONLY.
+    Author  : Robin Poulose - https://robztech.com
+    Version : 3.10
+    Setup   : CREATES an Entra app, certificate and consent (idempotent).
+    Report  : READ ONLY.
 
     Required: PowerShell 7.2+ on Windows, PnP.PowerShell, and a Global Administrator
     or Privileged Role Administrator for the one-time setup sign-in.
+
+    Provided as-is, without warranty. Review it and test in a non-production tenant first.
+    MIT License.
 
 .EXAMPLE
     .\Get-SPOOTPGuestReport.ps1
 
 .EXAMPLE
-    .\Get-SPOOTPGuestReport.ps1 -TenantName robzp -TenantDomain robzp.onmicrosoft.com
+    .\Get-SPOOTPGuestReport.ps1 -TenantName contoso -TenantDomain contoso.onmicrosoft.com
 
 .EXAMPLE
     .\Get-SPOOTPGuestReport.ps1 -SiteUrlFilter '*/sites/Finance*' -IncludeOneDrive:$false
+
+.EXAMPLE
+    .\Get-SPOOTPGuestReport.ps1 -IncludeSharedItems
+
+    Also lists the files and folders each external user holds a sharing link to. Slower.
+
+.EXAMPLE
+    .\Get-SPOOTPGuestReport.ps1 -TenantName contoso -TenantDomain contoso.onmicrosoft.com -UseCachedSetup
+
+    Unattended run: uses the saved setup without asking.
+
+.EXAMPLE
+    .\Get-SPOOTPGuestReport.ps1 -Reset
+
+    Runs setup again without asking, re-checking the app, certificate and consent.
 #>
 
 [CmdletBinding()]
@@ -64,8 +119,12 @@ param(
     [string]$AppName,
     [string]$AppNameSuffix,
 
-    # Re-run setup even if a cached, working configuration exists
+    # Re-run setup even if a saved, working configuration exists
     [switch]$Reset,
+
+    # Use a saved setup without asking. Without this, the script asks whether to use
+    # the saved setup or run setup again. Use it for unattended or scheduled runs.
+    [switch]$UseCachedSetup,
 
     # Certificate lifetime when this script creates one
     [int]$CertYears = 2,
@@ -87,12 +146,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '3.3'
+$ScriptVersion = '3.10'
 
-# Permissions this app needs, by resource app id
+# Permissions this app needs, by resource app id. Least privilege: the report reads guest
+# accounts and enumerates sites; it never invites or modifies users.
 $RequiredPermissions = @{
-    '00000003-0000-0000-c000-000000000000' = @('User.Read.All', 'User.Invite.All')  # Microsoft Graph
-    '00000003-0000-0ff1-ce00-000000000000' = @('Sites.FullControl.All')             # SharePoint
+    '00000003-0000-0000-c000-000000000000' = @('User.Read.All')          # Microsoft Graph
+    '00000003-0000-0ff1-ce00-000000000000' = @('Sites.FullControl.All')  # SharePoint
 }
 
 if (-not $AppName) {
@@ -101,7 +161,7 @@ if (-not $AppName) {
         $where = ($env:COMPUTERNAME -replace '[^A-Za-z0-9\-]', '')
         $AppNameSuffix = (@($who, $where) | Where-Object { $_ }) -join '-'
     }
-    $AppName = if ($AppNameSuffix) { "IP-SPO-OTP-Audit-$AppNameSuffix" } else { 'IP-SPO-OTP-Audit' }
+    $AppName = if ($AppNameSuffix) { "SPO-OTP-Audit-$AppNameSuffix" } else { 'SPO-OTP-Audit' }
 }
 
 Write-Host ""
@@ -215,7 +275,7 @@ function Get-ExpectedTenantId {
 function Get-GraphTokenByDeviceCode {
     param([string]$Tenant, [string[]]$Scopes)
 
-    $publicClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'   # Microsoft Graph PowerShell
+    $publicClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'   # Microsoft Graph PowerShell (public client)
     $scopeString = (($Scopes | ForEach-Object { "https://graph.microsoft.com/$_" }) -join ' ') + ' offline_access'
 
     $dc = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/devicecode" `
@@ -233,7 +293,7 @@ function Get-GraphTokenByDeviceCode {
     Write-Host ""
     Write-Host ("   Enter it at : {0}" -f $dc.verification_uri) -ForegroundColor White
     if ($copied) { Write-Host "   Already copied - press Ctrl+V in the code box." -ForegroundColor Green }
-    Write-Host "   Sign in as a Global Administrator of $Tenant." -ForegroundColor DarkGray
+    Write-Host "   Sign in as a Global Administrator or Privileged Role Administrator of $Tenant." -ForegroundColor DarkGray
     Write-Host "   This is the ONLY sign-in. There is no second code." -ForegroundColor DarkGray
     Write-Host ""
     Read-Host "   Press Enter to open the sign-in page"
@@ -272,9 +332,34 @@ function Get-GraphTokenByDeviceCode {
 
 function Invoke-Graph {
     param([hashtable]$Headers, [string]$Method = 'Get', [string]$Uri, $Body)
-    $args = @{ Headers = $Headers; Method = $Method; Uri = $Uri; ErrorAction = 'Stop' }
-    if ($Body) { $args['Body'] = ($Body | ConvertTo-Json -Depth 10) }
-    return Invoke-RestMethod @args
+    # Not named $args: that is a PowerShell automatic variable.
+    $request = @{ Headers = $Headers; Method = $Method; Uri = $Uri; ErrorAction = 'Stop' }
+    if ($Body) { $request['Body'] = ($Body | ConvertTo-Json -Depth 10) }
+    return Invoke-RestMethod @request
+}
+
+function Get-KeyCredentialThumbprint {
+    # Thumbprint of a certificate registered on an app. Computed from the certificate's own
+    # bytes ('key') when present, so it doesn't depend on how customKeyIdentifier is encoded.
+    # Fallback: customKeyIdentifier, documented as a 40-character value defaulting to the
+    # thumbprint - accepted as hex text, base64 of that text, or base64 of the raw 20 bytes.
+    param($KeyCredential)
+    if ($KeyCredential.key) {
+        try {
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String([string]$KeyCredential.key))
+            return $cert.Thumbprint.ToUpper()
+        } catch { }
+    }
+    $id = [string]$KeyCredential.customKeyIdentifier
+    if (-not $id) { return $null }
+    if ($id -match '^[0-9A-Fa-f]{40}$') { return $id.ToUpper() }
+    try {
+        $bytes = [Convert]::FromBase64String($id)
+        if ($bytes.Length -eq 20) { return ([BitConverter]::ToString($bytes) -replace '-', '') }
+        $text = [Text.Encoding]::ASCII.GetString($bytes)
+        if ($text -match '^[0-9A-Fa-f]{40}$') { return $text.ToUpper() }
+    } catch { }
+    return $null
 }
 
 function Initialize-AppRegistration {
@@ -315,6 +400,7 @@ function Initialize-AppRegistration {
     # --- find or create the application ---
     $escaped = $AppName.Replace("'", "''")
     $app = @((Invoke-Graph -Headers $headers -Uri "$base/applications?`$filter=displayName eq '$escaped'").value)[0]
+    $createdApp = $false
 
     if ($app) {
         Write-Host ("  App exists  : {0}" -f $app.appId) -ForegroundColor DarkGreen
@@ -331,16 +417,17 @@ function Initialize-AppRegistration {
             signInAudience         = 'AzureADMyOrg'
             requiredResourceAccess = @($requiredResourceAccess)
         }
+        $createdApp = $true
         Write-Host ("  App created : {0}" -f $app.appId) -ForegroundColor Green
     }
 
     # --- certificate: reuse a local one the app already trusts, else create and upload ---
-    $appCertThumbs = @()
-    foreach ($k in @($app.keyCredentials)) {
-        if ($k.customKeyIdentifier) {
-            try { $appCertThumbs += ([BitConverter]::ToString([byte[]]$k.customKeyIdentifier) -replace '-', '').ToUpper() } catch { }
-        }
+    # Graph only returns each certificate's bytes ('key') for a single-app GET with $select.
+    $appKeys = @($app.keyCredentials)
+    if (-not $createdApp) {
+        try { $appKeys = @((Invoke-Graph -Headers $headers -Uri "$base/applications/$($app.id)?`$select=keyCredentials").keyCredentials) } catch { }
     }
+    $appCertThumbs = @($appKeys | ForEach-Object { Get-KeyCredentialThumbprint -KeyCredential $_ } | Where-Object { $_ })
 
     $localCert = Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
                  Where-Object { $_.Subject -like "*CN=$AppName*" -and $_.NotAfter -gt (Get-Date).AddDays(30) -and
@@ -351,14 +438,26 @@ function Initialize-AppRegistration {
         Write-Host ("  Certificate : reusing {0}" -f $localCert.Thumbprint) -ForegroundColor DarkGreen
     }
     else {
+        # Uploading below REPLACES the app's whole keyCredentials collection, so ask before
+        # discarding certificates this machine doesn't hold - something else may use them.
+        if (-not $createdApp -and $appKeys.Count -gt 0) {
+            Write-Host ("  App '{0}' has certificate(s) that are not in this user's store:" -f $AppName) -ForegroundColor Yellow
+            foreach ($k in $appKeys) {
+                Write-Host ("     {0}  expires {1}" -f (Get-KeyCredentialThumbprint -KeyCredential $k), $k.endDateTime) -ForegroundColor Yellow
+            }
+            Write-Host "  Replacing them breaks anything else that signs in with them." -ForegroundColor Yellow
+            $answer = "$(Read-Host '  Replace with a new certificate from this machine? [y/N]')".Trim()
+            if ($answer -notmatch '^(y|yes)$') {
+                throw "Stopped without changing the app. Run again with -AppName <new name> to create a separate app instead."
+            }
+        }
+
         Write-Host "  Certificate : creating a new one" -ForegroundColor Cyan
         $localCert = New-SelfSignedCertificate -Subject "CN=$AppName" `
             -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy Exportable `
             -KeySpec Signature -KeyAlgorithm RSA -KeyLength 2048 `
             -NotAfter (Get-Date).AddYears($CertYears) -ErrorAction Stop
 
-        # PATCH replaces the whole collection; Graph never returns existing key material,
-        # so old certificates cannot be preserved. Safe here - the app is per user+machine.
         Invoke-Graph -Headers $headers -Method Patch -Uri "$base/applications/$($app.id)" -Body @{
             keyCredentials = @(@{
                 type        = 'AsymmetricX509Cert'
@@ -429,6 +528,40 @@ function Connect-WithRetry {
     }
 }
 
+function Invoke-WithPropagationRetry {
+    # A new app certificate or consent replicates across Entra over a minute or two, and
+    # until it has, a token request can fail on one replica after succeeding on another:
+    # SharePoint connects, then the first Graph call fails with AADSTS700027 ("certificate
+    # not registered on application"). SharePoint is slowest of all to honour a new app's
+    # Sites.FullControl.All grant, so its first tenant-admin call can return 401
+    # Unauthorized even though Connect-PnPOnline succeeded - that cmdlet doesn't check
+    # authorisation, the first real call does. A brand-new service principal can also be
+    # unknown to Graph for a while: "The identity of the calling application could not be
+    # established" (Authorization_IdentityNotFound).
+    #
+    # Each layer fails with a different message, so matching messages alone keeps missing
+    # one. Right after setup the caller passes -AnyError: the app is known to be settling,
+    # so every error is retried. On a run that reuses a saved setup, only the known
+    # replication errors are retried, and a genuine failure still surfaces immediately.
+    #
+    # -BeforeRetry runs before every retry. Pass a reconnect: a token issued before consent
+    # replicated has no roles and stays cached for its lifetime, so retrying on the same
+    # connection fails forever.
+    param([scriptblock]$Action, [string]$What, [int]$Attempts = 6, [int]$DelaySeconds = 20,
+          [switch]$AnyError, [scriptblock]$BeforeRetry)
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try { return & $Action }
+        catch {
+            $msg = $_.Exception.Message
+            $transient = $AnyError -or ($msg -match 'AADSTS700027|AADSTS700016|Authorization_IdentityNotFound|identity of the calling application could not be established|Authorization_RequestDenied|Insufficient privileges|\(403\)|Forbidden|\(401\)|Unauthorized')
+            if (-not $transient -or $i -eq $Attempts) { throw }
+            Write-Host ("  {0}: attempt {1}/{2} failed, retrying in {3}s (Entra propagation)..." -f $What, $i, $Attempts, $DelaySeconds) -ForegroundColor DarkYellow
+            Start-Sleep -Seconds $DelaySeconds
+            if ($BeforeRetry) { try { & $BeforeRetry } catch { } }
+        }
+    }
+}
+
 function Test-IsExternalLogin {
     param([string]$LoginName)
     return ($LoginName -like '*urn:spo:guest*' -or $LoginName -like '*spo%3aguest*' -or $LoginName -like '*#EXT#*')
@@ -482,9 +615,9 @@ function Get-SiteExternalItemMap {
           a) the guest is a DIRECT principal on an item with unique permissions
           b) the guest is a MEMBER of a SharingLinks.<guid> group that is a principal
 
-        Scale: items are paged in bulk with HasUniqueRoleAssignments selected, so the
-        26k-item library costs a handful of calls, not 26k. Only the items that come
-        back with unique permissions cost one extra call each.
+        Scale: items are paged in bulk with HasUniqueRoleAssignments selected, so a
+        large library costs a handful of calls, not one per item. Only the items that
+        come back with unique permissions cost one extra call each.
     #>
     param([int]$MaxItemsPerList = 20000)
 
@@ -570,26 +703,68 @@ function Get-SiteExternalItemMap {
 # ===========================================================================
 # Setup - cached config first, otherwise run it
 # ===========================================================================
+$fromCache = $false
 if (-not $Reset -and -not $ClientId -and (Test-Path $ConfigPath)) {
     try {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         $ClientId = $cfg.ClientId
         $CertificateThumbprint = $cfg.CertificateThumbprint
-        Write-Host ("Using cached setup: {0} ({1})" -f $cfg.AppName, $ClientId) -ForegroundColor DarkGreen
+        $fromCache = $true
     }
     catch { Write-Warning ("Could not read {0}: {1}" -f $ConfigPath, $_.Exception.Message) }
 }
 
-# A cached certificate that is missing or expired means setup has to run again
+# A certificate that is missing or expired means setup has to run again
+$haveCert = $null
 if ($ClientId -and $CertificateThumbprint) {
     $haveCert = Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
-                Where-Object { $_.Thumbprint -eq $CertificateThumbprint -and $_.NotAfter -gt (Get-Date) }
+                Where-Object { $_.Thumbprint -eq $CertificateThumbprint -and $_.NotAfter -gt (Get-Date) } |
+                Select-Object -First 1
     if (-not $haveCert) {
-        Write-Host "Cached certificate is missing or expired - running setup again." -ForegroundColor Yellow
-        $ClientId = $null; $CertificateThumbprint = $null
+        Write-Host "Saved certificate is missing or expired - running setup again." -ForegroundColor Yellow
+        $ClientId = $null; $CertificateThumbprint = $null; $fromCache = $false
     }
 }
 
+# A usable saved setup exists: ask rather than assume, unless told to use it
+if ($fromCache -and -not $UseCachedSetup) {
+    Write-Host ""
+    Write-Host ("Found a saved setup for {0}:" -f $TenantName) -ForegroundColor Cyan
+    Write-Host ("  App         : {0}" -f $cfg.AppName)
+    Write-Host ("  Client ID   : {0}" -f $ClientId)
+    Write-Host ("  Certificate : {0} (expires {1:yyyy-MM-dd})" -f $CertificateThumbprint, $haveCert.NotAfter)
+    if ($cfg.SavedUtc) {
+        # ConvertFrom-Json turns the ISO timestamp into a DateTime on PowerShell 7, which
+        # would otherwise print in local format with no zone.
+        $saved = if ($cfg.SavedUtc -is [datetime]) { $cfg.SavedUtc.ToUniversalTime().ToString('yyyy-MM-dd HH:mm') }
+                 else { "$($cfg.SavedUtc)" -replace 'T', ' ' -replace ':\d{2}Z$', '' }
+        Write-Host ("  Saved       : {0} UTC" -f $saved)
+    }
+    Write-Host ""
+    Write-Host "  [U] Use this saved setup (default)"
+    Write-Host "  [R] Run setup again - re-checks the app, certificate and consent, recreating anything missing"
+    Write-Host "  [Q] Quit"
+
+    while ($true) {
+        $choice = "$(Read-Host '  Choose U, R or Q')".Trim().ToUpper()
+        if ($choice -in @('', 'U')) {
+            Write-Host ("Using saved setup: {0} ({1})" -f $cfg.AppName, $ClientId) -ForegroundColor DarkGreen
+            break
+        }
+        if ($choice -eq 'R') {
+            $Reset = $true
+            $ClientId = $null; $CertificateThumbprint = $null
+            break
+        }
+        if ($choice -eq 'Q') { return }
+        Write-Host "  Enter U, R or Q." -ForegroundColor Yellow
+    }
+}
+elseif ($fromCache) {
+    Write-Host ("Using saved setup: {0} ({1})" -f $cfg.AppName, $ClientId) -ForegroundColor DarkGreen
+}
+
+$freshSetup = $false
 if ($Reset -or -not $ClientId -or -not $CertificateThumbprint) {
     Write-Host ""
     Write-Host "SETUP - app registration, certificate and admin consent" -ForegroundColor Yellow
@@ -605,7 +780,13 @@ if ($Reset -or -not $ClientId -or -not $CertificateThumbprint) {
 
     Write-Host ""
     Write-Host "Setup complete." -ForegroundColor Green
+    Write-Host "A new app takes a few minutes to be recognised everywhere - first calls may retry." -ForegroundColor DarkGray
+    $freshSetup = $true
 }
+
+# Right after setup, any failure is most likely the new app still replicating, so retry
+# everything for up to ~5 minutes. With a saved setup, retry known replication errors only.
+$retryAttempts = if ($freshSetup) { 15 } else { 6 }
 
 Write-Host ""
 Write-Host ("Tenant      : {0}.sharepoint.com" -f $TenantName) -ForegroundColor DarkCyan
@@ -630,6 +811,14 @@ catch {
     return
 }
 
+# Disconnect first: a token issued before the grant replicated has no roles and is cached
+# for its lifetime, so reconnecting without tearing the old connection down can hand back
+# the same useless token and every retry then fails for the same reason.
+$reconnect = {
+    try { Disconnect-PnPOnline } catch { }
+    Connect-PnPOnline -Url $adminUrl -ClientId $ClientId -Tenant $TenantDomain -Thumbprint $CertificateThumbprint
+}
+
 # ===========================================================================
 # 2. Entra guest index
 # ===========================================================================
@@ -640,7 +829,8 @@ $guestCount = 0
 try {
     $url = "v1.0/users?`$filter=userType eq 'Guest'&`$select=id,displayName,mail,userPrincipalName,externalUserState&`$top=999"
     while ($url) {
-        $page = Invoke-PnPGraphMethod -Url $url -Method Get
+        $page = Invoke-WithPropagationRetry -What 'Reading guests' -Attempts $retryAttempts -AnyError:$freshSetup `
+                    -BeforeRetry $reconnect -Action { Invoke-PnPGraphMethod -Url $url -Method Get }
         foreach ($g in @($page.value)) {
             $guestCount++
             $keys = @()
@@ -663,8 +853,24 @@ catch {
 # 3. Sites
 # ===========================================================================
 Write-Host "Enumerating sites..." -ForegroundColor Cyan
-$sites = Get-PnPTenantSite -IncludeOneDriveSites:$IncludeOneDrive |
-         Where-Object { $_.Template -notlike 'RedirectSite*' }
+try {
+    $sites = Invoke-WithPropagationRetry -What 'Enumerating sites' -Attempts $retryAttempts -AnyError:$freshSetup -BeforeRetry $reconnect -Action {
+                 Get-PnPTenantSite -IncludeOneDriveSites:$IncludeOneDrive
+             } | Where-Object { $_.Template -notlike 'RedirectSite*' }
+}
+catch {
+    Write-Host ""
+    Write-Host ("Could not list sites: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    if ($_.Exception.Message -match 'Unauthorized|\(401\)|\(403\)|Forbidden') {
+        Write-Host "SharePoint has not accepted this app's Sites.FullControl.All grant yet. This is" -ForegroundColor Yellow
+        Write-Host "normal for a newly created app and usually clears within 10-20 minutes." -ForegroundColor Yellow
+        Write-Host "  1. Wait, then run this script again and choose [U] to reuse the same setup." -ForegroundColor Yellow
+        Write-Host "  2. Do NOT re-run setup - a new certificate restarts the wait." -ForegroundColor Yellow
+        Write-Host "  3. Still failing? Run Test-SPOOTPSetup.ps1 to see whether the token carries the role." -ForegroundColor Yellow
+    }
+    Disconnect-PnPOnline
+    return
+}
 if ($SiteUrlFilter) { $sites = $sites | Where-Object { $_.Url -like $SiteUrlFilter } }
 Write-Host ("  {0} sites in scope" -f @($sites).Count) -ForegroundColor Green
 
@@ -688,9 +894,7 @@ foreach ($site in $sites) {
         $sharingMap = @{}
         if ($IncludeSharedItems) { $sharingMap = Get-SiteExternalItemMap -MaxItemsPerList $MaxItemsPerList }
 
-        $externalUsers = Get-PnPUser | Where-Object {
-            $_.LoginName -like '*urn:spo:guest*' -or $_.LoginName -like '*spo%3aguest*' -or $_.LoginName -like '*#EXT#*'
-        }
+        $externalUsers = Get-PnPUser | Where-Object { Test-IsExternalLogin -LoginName $_.LoginName }
 
         foreach ($u in $externalUsers) {
             $isSpoOtp = ($u.LoginName -like '*urn:spo:guest*' -or $u.LoginName -like '*spo%3aguest*')
@@ -760,5 +964,7 @@ if ($failedSites.Count -gt 0) {
 Write-Host ""
 Write-Host "Reminder: guests who never signed in do not appear in the site user list." -ForegroundColor DarkCyan
 Write-Host "Cross-check with the site-level external sharing report in the SharePoint admin centre." -ForegroundColor DarkCyan
+Write-Host "The CSV contains external users' names and email addresses - handle it as confidential." -ForegroundColor DarkCyan
+Write-Host "When the audit is finished, delete the app registration - see CLEANUP in Get-Help." -ForegroundColor DarkCyan
 
 Disconnect-PnPOnline
